@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Range Day - Shooting Game</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #1b1d1a;
+    color: #cfd3c7;
+    font-family: "Trebuchet MS", Arial, sans-serif;
+  }
+  h1 { margin: 0 0 6px; font-size: 1.6rem; letter-spacing: 1px; color: #e3c46b; }
+  p  { margin: 8px 0 0; font-size: 0.9rem; color: #8d9387; text-align: center; }
+  canvas {
+    width: 800px;
+    max-width: 96vw;
+    height: auto;
+    border: 3px solid #3a3d36;
+    border-radius: 6px;
+    cursor: none;              /* we draw our own crosshair */
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+
+<h1>RANGE DAY</h1>
+<canvas id="game" width="800" height="500"></canvas>
+<p>Mouse = aim &nbsp;|&nbsp; Click = fire &nbsp;|&nbsp; R = reload &nbsp;|&nbsp; On phones: tap to fire, tap RELOAD</p>
+
+<script>
+  // ============ SETUP ============
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");      // ctx is our "pen"
+  const W = canvas.width, H = canvas.height;
+
+  const MAG_SIZE = 12;        // bullets per magazine
+  const GAME_SECONDS = 60;
+  // Three "lanes": far, middle, near. Far targets are smaller and worth more.
+  const LANES = [
+    { y: 285, scale: 0.55, bonus: 3 },
+    { y: 350, scale: 0.85, bonus: 2 },
+    { y: 425, scale: 1.25, bonus: 1 }
+  ];
+
+  let state = "menu";          // "menu", "play" or "over"
+  let targets, popups, dust;
+  let score, shots, hits, ammo, reloading, reloadEnd;
+  let startTime, lastSpawn, overTime = 0;
+  let recoil = 0, flash = 0, shake = 0;
+  let best = 0;
+  const mouse = { x: W / 2, y: H / 2 };
+
+  function startGame() {
+    targets = []; popups = []; dust = [];
+    score = 0; shots = 0; hits = 0;
+    ammo = MAG_SIZE; reloading = false;
+    startTime = performance.now();
+    lastSpawn = 0;
+    state = "play";
+  }
+
+  // ============ SOUND (made with code, no files needed) ============
+  let audio;
+  function noise(duration, volume, filterFreq) {
+    if (!audio) return;
+    const length = audio.sampleRate * duration;
+    const buffer = audio.createBuffer(1, length, audio.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 3);  // fades out fast
+    }
+    const src = audio.createBufferSource();
+    const filter = audio.createBiquadFilter();
+    const gain = audio.createGain();
+    filter.frequency.value = filterFreq;
+    gain.gain.value = volume;
+    src.buffer = buffer;
+    src.connect(filter); filter.connect(gain); gain.connect(audio.destination);
+    src.start();
+  }
+  function tone(freq, duration, volume) {
+    if (!audio) return;
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.frequency.setValueAtTime(freq, audio.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(freq / 3, audio.currentTime + duration);
+    gain.gain.setValueAtTime(volume, audio.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + duration);
+    osc.connect(gain); gain.connect(audio.destination);
+    osc.start(); osc.stop(audio.currentTime + duration);
+  }
+  const soundShot  = () => { noise(0.25, 0.9, 3000); tone(120, 0.15, 0.8); };
+  const soundClick = () => { noise(0.03, 0.4, 6000); };
+  const soundHit   = () => { tone(900, 0.08, 0.25); };
+
+  // ============ CONTROLS ============
+  function updateMouse(e) {
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = (e.clientX - rect.left) * (W / rect.width);
+    mouse.y = (e.clientY - rect.top) * (H / rect.height);
+  }
+  canvas.addEventListener("pointermove", updateMouse);
+
+  canvas.addEventListener("pointerdown", e => {
+    updateMouse(e);
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+    if (state === "menu" || (state === "over" && performance.now() - overTime > 700)) {
+      startGame();
+    } else if (state === "play") {
+      // Tapping the RELOAD box (bottom-right) reloads instead of firing
+      if (mouse.x > W - 120 && mouse.y > H - 50) reload();
+      else shoot();
+    }
+  });
+  window.addEventListener("keydown", e => {
+    if (e.key === "r" || e.key === "R") reload();
+  });
+
+  // ============ SHOOTING ============
+  // Where the bullet will really go: the mouse, plus a tiny hand shake, minus recoil kick
+  function aimPoint() {
+    const t = performance.now();
+    return {
+      x: mouse.x + Math.sin(t / 700) * 3,
+      y: mouse.y + Math.cos(t / 530) * 3 - recoil
+    };
+  }
+
+  function reload() {
+    if (state !== "play" || reloading || ammo === MAG_SIZE) return;
+    reloading = true;
+    reloadEnd = performance.now() + 1400;
+    soundClick();
+    setTimeout(soundClick, 700);
+  }
+
+  function shoot() {
+    if (reloading) return;
+    if (ammo <= 0) { soundClick(); return; }   // empty: just a click
+    const aim = aimPoint();
+    ammo--; shots++;
+    soundShot();
+    recoil += 16;                      // gun kicks upward
+    mouse.x += (Math.random() - 0.5) * 6;
+    flash = 4; shake = 5;
+
+    // Check the nearest targets first
+    const sorted = targets.slice().sort((a, b) => b.scale - a.scale);
+    for (const t of sorted) {
+      if (t.state !== "up") continue;
+      // Convert the shot into the target's own coordinates
+      const lx = (aim.x - t.x) / t.scale;
+      const ly = (aim.y - t.y) / t.scale;
+      const headHit = Math.hypot(lx, ly + 118) <= 16;
+      const bodyHit = Math.abs(lx) <= 30 && ly >= -100 && ly <= 0;
+      if (headHit || bodyHit) {
+        const points = (headHit ? 10 : 5) * t.bonus;
+        score += points; hits++;
+        t.holes.push({ x: lx, y: ly });
+        popups.push({ x: aim.x, y: aim.y - 10, text: "+" + points, life: 45 });
+        soundHit();
+        return;
+      }
+    }
+    // Missed everything: kick up some dust
+    for (let i = 0; i < 5; i++) {
+      dust.push({ x: aim.x, y: aim.y, vx: (Math.random() - 0.5) * 2, vy: -Math.random() * 1.5, r: 3, life: 25 });
+    }
+  }
+
+  // ============ GAME LOGIC ============
+  function spawnTarget(now) {
+    const lane = LANES[Math.floor(Math.random() * LANES.length)];
+    const elapsed = (now - startTime) / 1000;
+    targets.push({
+      x: 70 + Math.random() * (W - 140),
+      y: lane.y,
+      scale: lane.scale,
+      bonus: lane.bonus,
+      state: "rising",
+      angle: Math.PI / 2,                       // lying flat at the start
+      timeUp: 100 + Math.random() * 80 - elapsed,  // targets stay up less time as you go
+      holes: []
+    });
+  }
+
+  function update() {
+    if (state !== "play") return;
+    const now = performance.now();
+    const timeLeft = GAME_SECONDS - (now - startTime) / 1000;
+    if (timeLeft <= 0) {
+      state = "over"; overTime = now;
+      best = Math.max(best, score);
+      return;
+    }
+
+    if (reloading && now >= reloadEnd) { reloading = false; ammo = MAG_SIZE; }
+
+    // Add a new target now and then (max 4 standing at once)
+    if (now - lastSpawn > 650 && targets.length < 4) { spawnTarget(now); lastSpawn = now; }
+
+    for (let i = targets.length - 1; i >= 0; i--) {
+      const t = targets[i];
+      if (t.state === "rising") {
+        t.angle -= 0.09;
+        if (t.angle <= 0) { t.angle = 0; t.state = "up"; }
+      } else if (t.state === "up") {
+        if (--t.timeUp <= 0) t.state = "falling";
+      } else if (t.state === "falling") {
+        t.angle += 0.09;
+        if (t.angle >= Math.PI / 2) targets.splice(i, 1);
+      }
+    }
+
+    recoil *= 0.88;                 // the gun settles back down
+    if (flash > 0) flash--;
+    if (shake > 0) shake *= 0.8;
+    for (const p of popups) { p.life--; p.y -= 0.8; }
+    popups = popups.filter(p => p.life > 0);
+    for (const d of dust) { d.x += d.vx; d.y += d.vy; d.r += 0.4; d.life--; }
+    dust = dust.filter(d => d.life > 0);
+  }
+
+  // ============ DRAWING ============
+  function drawScene() {
+    // Sky
+    let g = ctx.createLinearGradient(0, 0, 0, 250);
+    g.addColorStop(0, "#7fa9d1"); g.addColorStop(1, "#dbe6e8");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, 260);
+    // Far hills
+    ctx.fillStyle = "#6c8467";
+    ctx.beginPath(); ctx.moveTo(0, 260);
+    ctx.bezierCurveTo(150, 190, 300, 250, 450, 215);
+    ctx.bezierCurveTo(600, 180, 700, 240, 800, 205);
+    ctx.lineTo(800, 260); ctx.fill();
+    // Ground
+    g = ctx.createLinearGradient(0, 260, 0, H);
+    g.addColorStop(0, "#9a8860"); g.addColorStop(1, "#5a4c30");
+    ctx.fillStyle = g; ctx.fillRect(0, 260, W, H - 260);
+    // Lane lines (dirt berms) to give depth
+    for (const lane of LANES) {
+      ctx.fillStyle = "rgba(60, 48, 28, 0.35)";
+      ctx.fillRect(0, lane.y, W, 5 * lane.scale + 2);
+    }
+  }
+
+  function drawTarget(t) {
+    ctx.save();
+    ctx.translate(t.x, t.y);
+    ctx.scale(t.scale, t.scale * Math.cos(t.angle));   // squash = tipping over
+    // Wooden stand
+    ctx.fillStyle = "#4a3a22";
+    ctx.fillRect(-4, -10, 8, 14);
+    // Cardboard silhouette
+    ctx.fillStyle = "#d6c7a0";
+    ctx.strokeStyle = "#3b3220";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-30, 0); ctx.lineTo(-30, -85);
+    ctx.quadraticCurveTo(-30, -100, -15, -100);
+    ctx.lineTo(15, -100);
+    ctx.quadraticCurveTo(30, -100, 30, -85);
+    ctx.lineTo(30, 0); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, -118, 16, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // Scoring rings
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(0, -65, 20, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, -65, 9, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, -118, 8, 0, Math.PI * 2); ctx.stroke();
+    // Bullet holes
+    ctx.fillStyle = "#1c1810";
+    for (const h of t.holes) { ctx.beginPath(); ctx.arc(h.x, h.y, 2.6, 0, Math.PI * 2); ctx.fill(); }
+    ctx.restore();
+  }
+
+  function drawGun(aim) {
+    // A pistol seen from behind, sitting low on the screen and following your aim
+    const gx = W / 2 + (aim.x - W / 2) * 0.45;
+    ctx.save();
+    ctx.translate(gx, H + recoil * 0.8);
+    ctx.rotate((aim.x - gx) / 1400);
+    ctx.fillStyle = "#24262a";                      // slide
+    ctx.beginPath();
+    ctx.moveTo(-34, 0); ctx.lineTo(-26, -92); ctx.lineTo(26, -92); ctx.lineTo(34, 0);
+    ctx.fill();
+    ctx.fillStyle = "#33363b";                      // top highlight
+    ctx.fillRect(-22, -92, 44, 6);
+    ctx.fillStyle = "#0c0d0e";                      // rear sight notch
+    ctx.fillRect(-12, -92, 24, 5);
+    ctx.fillStyle = "#e8e8e8";                      // sight dots
+    ctx.fillRect(-14, -90, 4, 4); ctx.fillRect(10, -90, 4, 4);
+    if (flash > 0) {                                // muzzle flash
+      const f = ctx.createRadialGradient(0, -100, 2, 0, -100, 60);
+      f.addColorStop(0, "rgba(255, 240, 160, 0.95)");
+      f.addColorStop(1, "rgba(255, 150, 40, 0)");
+      ctx.fillStyle = f;
+      ctx.beginPath(); ctx.arc(0, -100, 60, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawCrosshair(aim) {
+    ctx.strokeStyle = "#ff4b3e";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(aim.x, aim.y, 9 + recoil * 0.4, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(aim.x - 16, aim.y); ctx.lineTo(aim.x - 5, aim.y);
+    ctx.moveTo(aim.x + 5, aim.y);  ctx.lineTo(aim.x + 16, aim.y);
+    ctx.moveTo(aim.x, aim.y - 16); ctx.lineTo(aim.x, aim.y - 5);
+    ctx.moveTo(aim.x, aim.y + 5);  ctx.lineTo(aim.x, aim.y + 16);
+    ctx.stroke();
+  }
+
+  function drawHUD() {
+    const timeLeft = Math.max(0, GAME_SECONDS - (performance.now() - startTime) / 1000);
+    ctx.fillStyle = "rgba(15, 16, 14, 0.7)";
+    ctx.fillRect(0, 0, W, 40);
+    ctx.fillStyle = "#e9e6d8";
+    ctx.font = "bold 20px Trebuchet MS, Arial";
+    ctx.textAlign = "left";  ctx.fillText("SCORE " + score, 14, 27);
+    ctx.textAlign = "center"; ctx.fillText("TIME " + Math.ceil(timeLeft), W / 2, 27);
+    ctx.textAlign = "right";
+    const acc = shots ? Math.round(hits / shots * 100) : 0;
+    ctx.fillText("ACCURACY " + acc + "%", W - 14, 27);
+
+    // Magazine: one little brass bullet per round
+    for (let i = 0; i < MAG_SIZE; i++) {
+      ctx.fillStyle = i < ammo ? "#d9b04a" : "#4a4a44";
+      ctx.fillRect(14 + i * 14, H - 42, 8, 26);
+    }
+    if (reloading) {
+      ctx.fillStyle = "#e9e6d8"; ctx.textAlign = "left";
+      ctx.font = "bold 18px Trebuchet MS, Arial";
+      ctx.fillText("RELOADING...", 14, H - 52);
+    } else if (ammo === 0) {
+      ctx.fillStyle = "#ff6a5c"; ctx.textAlign = "left";
+      ctx.font = "bold 18px Trebuchet MS, Arial";
+      ctx.fillText("EMPTY - PRESS R", 14, H - 52);
+    }
+    // Reload button for touch screens
+    ctx.fillStyle = "rgba(15, 16, 14, 0.7)";
+    ctx.fillRect(W - 110, H - 42, 100, 32);
+    ctx.fillStyle = "#e9e6d8"; ctx.textAlign = "center";
+    ctx.font = "bold 14px Trebuchet MS, Arial";
+    ctx.fillText("RELOAD", W - 60, H - 21);
+  }
+
+  function drawOverlay(lines) {
+    ctx.fillStyle = "rgba(12, 13, 11, 0.78)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e3c46b";
+    ctx.font = "bold 44px Trebuchet MS, Arial";
+    ctx.fillText(lines[0], W / 2, 190);
+    ctx.fillStyle = "#e9e6d8";
+    ctx.font = "20px Trebuchet MS, Arial";
+    for (let i = 1; i < lines.length; i++) ctx.fillText(lines[i], W / 2, 190 + i * 34);
+  }
+
+  function draw() {
+    ctx.save();
+    ctx.clearRect(0, 0, W, H);
+    if (shake > 0.3) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    drawScene();
+
+    if (state !== "menu") {
+      // Draw far targets first so near ones cover them
+      targets.slice().sort((a, b) => a.scale - b.scale).forEach(drawTarget);
+      for (const d of dust) {
+        ctx.fillStyle = "rgba(190, 170, 130, " + d.life / 40 + ")";
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.font = "bold 20px Trebuchet MS, Arial"; ctx.textAlign = "center";
+      for (const p of popups) {
+        ctx.fillStyle = "rgba(255, 255, 255, " + p.life / 45 + ")";
+        ctx.fillText(p.text, p.x, p.y);
+      }
+    }
+
+    const aim = aimPoint();
+    if (state === "play") { drawGun(aim); drawHUD(); drawCrosshair(aim); }
+    ctx.restore();
+
+    if (state === "menu") {
+      drawOverlay(["RANGE DAY", "Hit the targets before the clock runs out.",
+        "Head = 10 points, body = 5. Far targets pay triple.",
+        "You have 12 rounds per magazine. Reload with R.", "", "Click to start"]);
+    } else if (state === "over") {
+      const acc = shots ? Math.round(hits / shots * 100) : 0;
+      drawOverlay(["TIME'S UP", "Score: " + score + "     Best: " + best,
+        "Shots: " + shots + "   Hits: " + hits + "   Accuracy: " + acc + "%", "", "Click to shoot again"]);
+    }
+    drawCrosshairIfMenu();
+  }
+  function drawCrosshairIfMenu() { if (state !== "play") drawCrosshair(mouse); }
+
+  // ============ GAME LOOP ============
+  function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+  }
+  targets = []; popups = []; dust = []; score = 0; shots = 0; hits = 0; ammo = MAG_SIZE;
+  loop();
+</script>
+</body>
+</html>
